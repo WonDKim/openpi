@@ -30,6 +30,8 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
+import sys
 from typing import Literal
 
 from flax.nnx import traversals
@@ -45,6 +47,14 @@ import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 from openpi.training import utils
 import openpi.training.config as _config
+
+
+def to_torch_tensor(val):
+    if not isinstance(val, np.ndarray):
+        val = np.array(val)
+    if val.dtype.name == "bfloat16":
+        return torch.from_numpy(val.view(np.uint16)).view(torch.bfloat16)
+    return torch.from_numpy(val)
 
 
 def slice_paligemma_state_dict(state_dict, config):
@@ -261,7 +271,7 @@ def slice_paligemma_state_dict(state_dict, config):
 
     for key, value in state_dict.items():
         if key not in expert_keys:
-            final_state_dict[key] = torch.from_numpy(value)
+            final_state_dict[key] = to_torch_tensor(value)
         else:
             expert_dict[key] = value
 
@@ -386,7 +396,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     final_state_dict = {}
     for key, value in state_dict.items():
         if not isinstance(value, torch.Tensor):
-            final_state_dict[key] = torch.from_numpy(value)
+            final_state_dict[key] = to_torch_tensor(value)
         else:
             final_state_dict[key] = value
 
@@ -420,7 +430,12 @@ def load_jax_model_and_print_keys(checkpoint_dir: str):
 
 
 def convert_pi0_checkpoint(
-    checkpoint_dir: str, precision: str, output_path: str, model_config: openpi.models.pi0_config.Pi0Config
+    checkpoint_dir: str,
+    precision: str,
+    output_path: str,
+    model_config: openpi.models.pi0_config.Pi0Config,
+    config_name: str | None = None,
+    stage: int = 0,
 ):
     """
     Convert PI0 JAX checkpoint to PyTorch format.
@@ -430,129 +445,199 @@ def convert_pi0_checkpoint(
         precision: Model precision (float32, bfloat16, float16)
         output_path: Path to save the converted PyTorch model
         model_config: Model config
+        config_name: Config name
+        stage: Stage of conversion (0=both via subprocesses, 1=JAX extraction, 2=PyTorch model)
     """
-    print(f"Converting PI0 checkpoint from {checkpoint_dir} to {output_path}")
-    print(f"Model config: {model_config}")
+    if stage == 0:
+        assert config_name is not None, "config_name must be provided in stage 0"
+        os.makedirs(output_path, exist_ok=True)
+        temp_path = os.path.join(output_path, "temp_weights.pt")
 
-    # Break down orbax ckpts by restoring via JAX to respect dtype
-    initial_params = slice_initial_orbax_checkpoint(checkpoint_dir=checkpoint_dir, restore_precision="float32")
+        # Run Stage 1: Load JAX and save temporary pytorch tensors
+        print("--- Stage 1: Extracting JAX parameters ---")
+        env1 = os.environ.copy()
+        env1["JAX_PLATFORMS"] = "cpu"
+        env1["CUDA_VISIBLE_DEVICES"] = ""
+        subprocess.run([
+            sys.executable,
+            __file__,
+            "--checkpoint-dir", checkpoint_dir,
+            "--config-name", config_name,
+            "--output-path", output_path,
+            "--precision", precision,
+            "--stage", "1"
+        ], env=env1, check=True)
 
-    # Process projection params
-    if model_config.pi05:
-        keys = [
-            "action_in_proj",
-            "action_out_proj",
-            "time_mlp_in",
-            "time_mlp_out",
-        ]
-    else:
-        keys = [
-            "state_proj",
-            "action_in_proj",
-            "action_out_proj",
-            "action_time_mlp_in",
-            "action_time_mlp_out",
-        ]
+        # Run Stage 2: Load temporary pytorch tensors and save to safetensors
+        print("--- Stage 2: Creating PyTorch model and saving Safetensors ---")
+        env2 = os.environ.copy()
+        env2["CUDA_VISIBLE_DEVICES"] = ""
+        subprocess.run([
+            sys.executable,
+            __file__,
+            "--checkpoint-dir", checkpoint_dir,
+            "--config-name", config_name,
+            "--output-path", output_path,
+            "--precision", precision,
+            "--stage", "2"
+        ], env=env2, check=True)
 
-    projection_params = {}
-    for key in keys:
-        kernel_params = initial_params["projection_params"][key]["kernel"]
-        bias_params = initial_params["projection_params"][key]["bias"]
-        if isinstance(kernel_params, dict):
-            weight = kernel_params["value"]
-            bias = bias_params["value"]
+        # Clean up temp files
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        print("Model conversion completed successfully!")
+        print(f"Model saved to {output_path}")
+        return
+
+    if stage == 1:
+        print(f"Converting PI0 checkpoint (Stage 1) from {checkpoint_dir} to {output_path}")
+        # Break down orbax ckpts by restoring via JAX to respect dtype
+        initial_params = slice_initial_orbax_checkpoint(checkpoint_dir=checkpoint_dir, restore_precision=precision)
+
+        # Process projection params
+        if model_config.pi05:
+            keys = [
+                "action_in_proj",
+                "action_out_proj",
+                "time_mlp_in",
+                "time_mlp_out",
+            ]
         else:
-            weight = kernel_params
-            bias = bias_params
+            keys = [
+                "state_proj",
+                "action_in_proj",
+                "action_out_proj",
+                "action_time_mlp_in",
+                "action_time_mlp_out",
+            ]
 
-        pytorch_weight_key = f"{key}.weight"
-        pytorch_bias_key = f"{key}.bias"
+        projection_params = {}
+        for key in keys:
+            kernel_params = initial_params["projection_params"][key]["kernel"]
+            bias_params = initial_params["projection_params"][key]["bias"]
+            if isinstance(kernel_params, dict):
+                weight = kernel_params["value"]
+                bias = bias_params["value"]
+            else:
+                weight = kernel_params
+                bias = bias_params
 
-        projection_params[pytorch_weight_key] = torch.from_numpy(np.array(weight)).T
-        projection_params[pytorch_bias_key] = torch.from_numpy(np.array(bias))
+            pytorch_weight_key = f"{key}.weight"
+            pytorch_bias_key = f"{key}.bias"
 
-    # Create configs based on checkpoint path
-    # All models use the same PaliGemma config structure
-    class PaliGemmaConfig:
-        def __init__(self):
-            self.vision_config = type(
-                "obj",
-                (object,),
-                {
-                    "hidden_size": 1152,
-                    "num_hidden_layers": 27,
-                    "num_attention_heads": 16,
-                    "intermediate_size": 4304,
-                    "patch_size": 14,
-                    "projection_dim": 2048,
-                },
-            )()
-            self.text_config = type(
-                "obj",
-                (object,),
-                {
-                    "hidden_size": 2048,
-                    "num_hidden_layers": 18,
-                    "num_attention_heads": 8,
-                    "head_dim": 256,
-                    "intermediate_size": 16384,
-                },
-            )()
+            projection_params[pytorch_weight_key] = to_torch_tensor(np.array(weight)).T
+            projection_params[pytorch_bias_key] = to_torch_tensor(np.array(bias))
 
-    paligemma_config = PaliGemmaConfig()
-    action_expert_config = openpi.models.gemma.get_config("gemma_300m")
+        # Create configs based on checkpoint path
+        # All models use the same PaliGemma config structure
+        class PaliGemmaConfig:
+            def __init__(self):
+                self.vision_config = type(
+                    "obj",
+                    (object,),
+                    {
+                        "hidden_size": 1152,
+                        "num_hidden_layers": 27,
+                        "num_attention_heads": 16,
+                        "intermediate_size": 4304,
+                        "patch_size": 14,
+                        "projection_dim": 2048,
+                    },
+                )()
+                self.text_config = type(
+                    "obj",
+                    (object,),
+                    {
+                        "hidden_size": 2048,
+                        "num_hidden_layers": 18,
+                        "num_attention_heads": 8,
+                        "head_dim": 256,
+                        "intermediate_size": 16384,
+                    },
+                )()
 
-    # Process PaliGemma weights
-    paligemma_params, expert_params = slice_paligemma_state_dict(initial_params["paligemma_params"], paligemma_config)
+        paligemma_config = PaliGemmaConfig()
+        action_expert_config = openpi.models.gemma.get_config("gemma_300m")
 
-    # Process Gemma weights from expert_params
-    gemma_params = slice_gemma_state_dict(
-        expert_params, action_expert_config, num_expert=1, checkpoint_dir=checkpoint_dir, pi05=model_config.pi05
-    )
+        # Process PaliGemma weights
+        paligemma_params, expert_params = slice_paligemma_state_dict(initial_params["paligemma_params"], paligemma_config)
 
-    # Instantiate model
-    pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_config)
+        # Free up memory
+        initial_params.clear()
+        import gc
+        gc.collect()
 
-    # Combine all parameters (no prefix needed for our model structure)
-    all_params = {**paligemma_params, **gemma_params, **projection_params}
+        # Process Gemma weights from expert_params
+        gemma_params = slice_gemma_state_dict(
+            expert_params, action_expert_config, num_expert=1, checkpoint_dir=checkpoint_dir, pi05=model_config.pi05
+        )
 
-    # Load state dict
-    pi0_model.load_state_dict(all_params, strict=False)
+        expert_params.clear()
+        gc.collect()
 
-    if precision == "float32":
-        pi0_model = pi0_model.to(torch.float32)
-    elif precision == "bfloat16":
-        pi0_model = pi0_model.to(torch.bfloat16)
-    else:
-        raise ValueError(f"Invalid precision: {precision}")
+        # Combine all parameters
+        all_params = {**paligemma_params, **gemma_params, **projection_params}
 
-    # Save the converted model using safetensors
-    os.makedirs(output_path, exist_ok=True)
+        # Save to temp file
+        temp_path = os.path.join(output_path, "temp_weights.pt")
+        torch.save(all_params, temp_path)
+        print(f"Saved temporary weights to {temp_path}")
+        return
 
-    # Save model weights as SafeTensors using save_model to handle tied weights
-    safetensors.torch.save_model(pi0_model, os.path.join(output_path, "model.safetensors"))
+    if stage == 2:
+        print(f"Converting PI0 checkpoint (Stage 2) into model.safetensors at {output_path}")
+        temp_path = os.path.join(output_path, "temp_weights.pt")
+        print(f"Loading temporary weights from {temp_path}...")
+        all_params = torch.load(temp_path, map_location="cpu")
 
-    # Copy assets folder if it exists
-    assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
-    if assets_source.exists():
-        assets_dest = pathlib.Path(output_path) / "assets"
-        if assets_dest.exists():
-            shutil.rmtree(assets_dest)
-        shutil.copytree(assets_source, assets_dest)
+        # Instantiate model
+        pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_config)
 
-    # Save config as JSON for reference
-    config_dict = {
-        "action_dim": model_config.action_dim,
-        "action_horizon": model_config.action_horizon,
-        "paligemma_variant": model_config.paligemma_variant,
-        "action_expert_variant": model_config.action_expert_variant,
-        "precision": precision,
-    }
-    with open(os.path.join(output_path, "config.json"), "w") as f:
-        json.dump(config_dict, f, indent=2)
+        # Load state dict in-place and pop to save memory
+        state_dict = pi0_model.state_dict()
+        for key in list(all_params.keys()):
+            if key in state_dict:
+                state_dict[key].copy_(all_params.pop(key))
 
-    print("Model conversion completed successfully!")
-    print(f"Model saved to {output_path}")
+        # Clear remaining items
+        all_params.clear()
+        import gc
+        gc.collect()
+
+        if precision == "float32":
+            pi0_model = pi0_model.to(torch.float32)
+        elif precision == "bfloat16":
+            pi0_model = pi0_model.to(torch.bfloat16)
+        else:
+            raise ValueError(f"Invalid precision: {precision}")
+
+        # Save the converted model using safetensors
+        os.makedirs(output_path, exist_ok=True)
+
+        # Save model weights as SafeTensors using save_model to handle tied weights
+        safetensors.torch.save_model(pi0_model, os.path.join(output_path, "model.safetensors"))
+
+        # Copy assets folder if it exists
+        assets_source = pathlib.Path(checkpoint_dir) / "assets"
+        if assets_source.exists():
+            assets_dest = pathlib.Path(output_path) / "assets"
+            if assets_dest.exists():
+                shutil.rmtree(assets_dest)
+            shutil.copytree(assets_source, assets_dest)
+
+        # Save config as JSON for reference
+        config_dict = {
+            "action_dim": model_config.action_dim,
+            "action_horizon": model_config.action_horizon,
+            "paligemma_variant": model_config.paligemma_variant,
+            "action_expert_variant": model_config.action_expert_variant,
+            "precision": precision,
+        }
+        with open(os.path.join(output_path, "config.json"), "w") as f:
+            json.dump(config_dict, f, indent=2)
+
+        print(f"Model saved successfully to {output_path}")
+        return
 
 
 def main(
@@ -562,14 +647,17 @@ def main(
     precision: Literal["float32", "bfloat16", "float16"] = "bfloat16",
     *,
     inspect_only: bool = False,
+    stage: int = 0,
 ):
     """Load JAX model and optionally convert to PyTorch.
 
     Args:
         checkpoint_dir: Path to the JAX checkpoint directory
+        config_name: Config name
         output_path: Path to save converted PyTorch model (required for conversion)
         precision: Precision for model conversion
         inspect_only: Only inspect parameter keys, don't convert
+        stage: Stage of conversion (0=both via subprocesses, 1=JAX extraction, 2=PyTorch model)
     """
     model_config = _config.get_config(config_name).model
     if not isinstance(model_config, openpi.models.pi0_config.Pi0Config):
@@ -580,8 +668,9 @@ def main(
         if not output_path:
             print("Error: --output_path is required for conversion. Use --inspect_only to only view keys.")
             return
-        convert_pi0_checkpoint(checkpoint_dir, precision, output_path, model_config)
+        convert_pi0_checkpoint(checkpoint_dir, precision, output_path, model_config, config_name=config_name, stage=stage)
 
 
 if __name__ == "__main__":
     tyro.cli(main)
+
